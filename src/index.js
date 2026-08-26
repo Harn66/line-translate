@@ -43,7 +43,11 @@ async function handleEvents(events, env) {
 
     let out;
     try {
-      out = await translate(ev.message.text, env);
+      out = await translate(ev.message.text, env, "gemini-3.5-flash");
+      if (out.includes('"code":503') || out.includes('"code":429')) {
+        await new Promise((r) => setTimeout(r, 1000));
+        out = await translate(ev.message.text, env, "gemini-3.5-flash-lite");
+      }
     } catch (err) {
       out = "Translation failed. Try again.";
     }
@@ -52,7 +56,7 @@ async function handleEvents(events, env) {
   }
 }
 
-async function translate(text, env) {
+async function translate(text, env, model) {
   const prompt = `You are translating messages in a LINE chat between hotel staff in Chiang Mai. They speak Thai, Burmese, English and Vietnamese.
 
 Detect the language of the MESSAGE below, then give it in the other three languages.
@@ -78,7 +82,7 @@ MESSAGE:
 ${text}`;
 
   const res = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
       method: "POST",
       headers: {
