@@ -1,6 +1,14 @@
-// --- who is speaking, so gendered particles come out right ---
-const MY_GENDER = "male";       // you — your messages become Thai
-const FRIEND_GENDER = "female"; // them — their messages become Burmese
+const MY_GENDER = "male";
+const FRIEND_GENDER = "female";
+
+const MENTIONS = ["@leon", "@harn", "@leon harn", "ลีออน", "လီယွန်"];
+
+const GROUPS = {
+  Ce540ec9ff202d5ad182d7614345ddc8d: { name: "Friend 1", mode: "translate" },
+  Ca7a3b1006ab5302107fb6998032820a3: { name: "Friend 2", mode: "translate" },
+  C07c69b8cbdb79abb044810a5f8604b99: { name: "Crush", mode: "translate" },
+  Ceacc44a74c00d696414e16fddc5e5763: { name: "Silent test", mode: "log" },
+};
 
 export default {
   async fetch(request, env, ctx) {
@@ -75,6 +83,27 @@ function decideTarget(text) {
   return null;
 }
 
+function mentionsMe(ev, text) {
+  const tagged = ev.message?.mention?.mentionees;
+  if (Array.isArray(tagged) && tagged.length > 0) return true;
+
+  const lower = text.toLowerCase();
+  return MENTIONS.some((m) => lower.includes(m));
+}
+
+function routeFor(ev) {
+  const src = ev.source ?? {};
+
+  if (src.type === "user") {
+    return { name: "direct", mode: "translate", log: false };
+  }
+
+  const conf = GROUPS[src.groupId];
+  if (!conf) return null;
+
+  return { name: conf.name, mode: conf.mode, log: conf.mode === "log" };
+}
+
 async function handleEvents(events, env) {
   const jobs = events
     .filter((ev) => ev.type === "message" && ev.message?.type === "text")
@@ -96,16 +125,84 @@ async function handleOne(ev, env) {
     return;
   }
 
-  const target = decideTarget(text);
+  const route = routeFor(ev);
+  if (!route) {
+    console.log("ignored: unknown room");
+    return;
+  }
 
+  const target = decideTarget(text);
   if (!target) {
     console.log("skipped:", text.slice(0, 40));
     return;
   }
 
-  const out = await translateWithFallback(text, target, env);
+  const translation = await translateWithFallback(text, target, env);
 
-  await reply(ev.replyToken, out, env);
+  const tasks = [];
+
+  if (route.mode === "translate") {
+    tasks.push(reply(ev.replyToken, translation, env));
+  }
+
+  if (route.log) {
+    tasks.push(
+      logToSheet(ev, route.name, text, translation, mentionsMe(ev, text), env)
+    );
+  }
+
+  await Promise.all(tasks);
+}
+
+async function logToSheet(ev, groupName, original, translation, mention, env) {
+  if (!env.SHEET_URL) return;
+
+  const sender = await senderName(ev, env);
+
+  try {
+    const res = await fetch(env.SHEET_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        secret: env.SHEET_SECRET,
+        group: groupName,
+        sender,
+        original,
+        translation,
+        mention,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!res.ok) {
+      console.log("sheet write failed:", res.status);
+    }
+  } catch (err) {
+    console.log("sheet write threw:", err);
+  }
+}
+
+async function senderName(ev, env) {
+  const src = ev.source ?? {};
+  if (!src.userId) return "unknown";
+
+  const url = src.groupId
+    ? `https://api.line.me/v2/bot/group/${src.groupId}/member/${src.userId}`
+    : `https://api.line.me/v2/bot/profile/${src.userId}`;
+
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${env.CHANNEL_ACCESS_TOKEN}` },
+      signal: AbortSignal.timeout(3000),
+    });
+
+    if (!res.ok) return src.userId.slice(0, 8);
+
+    const data = await res.json();
+    return data.displayName || src.userId.slice(0, 8);
+  } catch {
+    return src.userId.slice(0, 8);
+  }
 }
 
 async function translateWithFallback(text, target, env) {
@@ -113,7 +210,6 @@ async function translateWithFallback(text, target, env) {
   const started = Date.now();
 
   for (const model of MODELS) {
-    // start at a random key so concurrent messages spread out
     const offset = Math.floor(Math.random() * keys.length);
 
     for (let n = 0; n < keys.length; n++) {
@@ -128,7 +224,6 @@ async function translateWithFallback(text, target, env) {
       try {
         r = await translate(text, target, keys[i], model);
       } catch (err) {
-        // a timeout means this model is slow, not that the key is bad
         console.log(`${model} key${i + 1} threw:`, err);
         break;
       }
@@ -140,8 +235,6 @@ async function translateWithFallback(text, target, env) {
 
       console.log(`${model} key${i + 1} failed: ${r.status} ${r.detail}`);
 
-      // 429 = this key is out of quota, try another key
-      // anything else = a different key will not help, next model
       if (r.status !== 429) break;
     }
   }
