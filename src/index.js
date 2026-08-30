@@ -1,6 +1,8 @@
 const MY_GENDER = "male";
 const FRIEND_GENDER = "female";
 
+const MY_USER_ID = "Ua3a8f28e0fd8cdd360368751a955b4ae";
+
 const MENTIONS = ["@leon", "@harn", "@leon harn", "ลีออน", "လီယွန်"];
 
 const GROUPS = {
@@ -8,7 +10,13 @@ const GROUPS = {
   Ca7a3b1006ab5302107fb6998032820a3: { name: "Friend 2", mode: "translate" },
   C07c69b8cbdb79abb044810a5f8604b99: { name: "Crush", mode: "translate" },
   Ceacc44a74c00d696414e16fddc5e5763: { name: "Silent test", mode: "log" },
+  Ca6b9669c63ec56ff3f18407864f39c3e: { name: "Front desk", mode: "log" },
+  Cfd0f7423a7c8b661c4e2aa6aafd4bd12: { name: "TCMR TCMO", mode: "log" },
 };
+
+// how much of the conversation the model gets to see
+const CONTEXT_TURNS = 6;
+const CONTEXT_TTL = 1800; // 30 minutes
 
 export default {
   async fetch(request, env, ctx) {
@@ -85,7 +93,11 @@ function decideTarget(text) {
 
 function mentionsMe(ev, text) {
   const tagged = ev.message?.mention?.mentionees;
-  if (Array.isArray(tagged) && tagged.length > 0) return true;
+
+  if (Array.isArray(tagged) && tagged.length > 0) {
+    // only counts if one of the tagged people is actually me
+    return tagged.some((m) => m.userId === MY_USER_ID);
+  }
 
   const lower = text.toLowerCase();
   return MENTIONS.some((m) => lower.includes(m));
@@ -102,6 +114,39 @@ function routeFor(ev) {
   if (!conf) return null;
 
   return { name: conf.name, mode: conf.mode, log: conf.mode === "log" };
+}
+
+// One rolling window per room, shared by everyone in it.
+function contextKey(ev) {
+  const src = ev.source ?? {};
+  return "ctx:" + (src.groupId || src.roomId || src.userId || "unknown");
+}
+
+async function readContext(ev, env) {
+  if (!env.CHAT) return [];
+
+  try {
+    const raw = await env.CHAT.get(contextKey(ev));
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch (err) {
+    console.log("context read failed:", err);
+    return [];
+  }
+}
+
+async function writeContext(ev, env, history, speaker, text) {
+  if (!env.CHAT) return;
+
+  const next = [...history, { speaker, text }].slice(-CONTEXT_TURNS);
+
+  try {
+    await env.CHAT.put(contextKey(ev), JSON.stringify(next), {
+      expirationTtl: CONTEXT_TTL,
+    });
+  } catch (err) {
+    console.log("context write failed:", err);
+  }
 }
 
 async function handleEvents(events, env) {
@@ -125,6 +170,23 @@ async function handleOne(ev, env) {
     return;
   }
 
+  if (text === "/done") {
+    const src = ev.source ?? {};
+
+    if (src.type !== "user") {
+      await reply(
+        ev.replyToken,
+        "Send /done in our private chat, not a group.",
+        env
+      );
+      return;
+    }
+
+    const msg = await archiveTasks(env);
+    await reply(ev.replyToken, msg, env);
+    return;
+  }
+
   const route = routeFor(ev);
   if (!route) {
     console.log("ignored: unknown room");
@@ -137,7 +199,13 @@ async function handleOne(ev, env) {
     return;
   }
 
-  const translation = await translateWithFallback(text, target, env);
+  const sender = await senderName(ev, env);
+  const history = await readContext(ev, env);
+
+  const translation = await translateWithFallback(text, target, history, env);
+
+  // remember this turn for the next message in the room
+  await writeContext(ev, env, history, sender, text);
 
   const tasks = [];
 
@@ -147,17 +215,45 @@ async function handleOne(ev, env) {
 
   if (route.log) {
     tasks.push(
-      logToSheet(ev, route.name, text, translation, mentionsMe(ev, text), env)
+      logToSheet(
+        route.name,
+        sender,
+        text,
+        translation,
+        mentionsMe(ev, text),
+        env
+      )
     );
   }
 
   await Promise.all(tasks);
 }
 
-async function logToSheet(ev, groupName, original, translation, mention, env) {
-  if (!env.SHEET_URL) return;
+async function archiveTasks(env) {
+  if (!env.SHEET_URL) return "Sheet is not connected.";
 
-  const sender = await senderName(ev, env);
+  try {
+    const res = await fetch(env.SHEET_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        secret: env.SHEET_SECRET,
+        action: "archive",
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+
+    if (!res.ok) return "Sheet did not answer (" + res.status + ").";
+
+    return await res.text();
+  } catch (err) {
+    console.log("archive threw:", err);
+    return "Could not reach the sheet. Try again.";
+  }
+}
+
+async function logToSheet(groupName, sender, original, translation, mention, env) {
+  if (!env.SHEET_URL) return;
 
   try {
     const res = await fetch(env.SHEET_URL, {
@@ -205,7 +301,7 @@ async function senderName(ev, env) {
   }
 }
 
-async function translateWithFallback(text, target, env) {
+async function translateWithFallback(text, target, history, env) {
   const keys = keyring(env);
   const started = Date.now();
 
@@ -222,7 +318,7 @@ async function translateWithFallback(text, target, env) {
 
       let r;
       try {
-        r = await translate(text, target, keys[i], model);
+        r = await translate(text, target, history, keys[i], model);
       } catch (err) {
         console.log(`${model} key${i + 1} threw:`, err);
         break;
@@ -259,14 +355,26 @@ function voiceRules(target) {
     : `The speaker is MALE. Use male Burmese forms: ခင်ဗျာ for polite address, ကျွန်တော် for "I". Never use ရှင့် or ကျွန်မ.`;
 }
 
-async function translate(text, target, apiKey, model) {
+function contextBlock(history) {
+  if (!history.length) return "";
+
+  const lines = history.map((h) => `${h.speaker}: ${h.text}`).join("\n");
+
+  return `Here is what was said just before, oldest first. Use it to understand what the MESSAGE refers to — pronouns, short answers, and anything left unsaid. Do NOT translate these lines. They are background only.
+
+${lines}
+
+`;
+}
+
+async function translate(text, target, history, apiKey, model) {
   const prompt = `Translate the MESSAGE below into ${target}. The output must be written in ${target} and nothing else.
 
 ${voiceRules(target)}
 
-This is a real chat between two friends in Chiang Mai, so the input may be messy: typos, missing words, no punctuation, mixed-in English, or romanised script. Never comment on any of that. Work out what the sender meant and translate that meaning.
+${contextBlock(history)}This is a real chat, so the input may be messy: typos, missing words, no punctuation, mixed-in English, or romanised script. Never comment on any of that. Work out what the sender meant and translate that meaning.
 
-Accuracy comes first. The reader must receive exactly what the sender meant — no additions, no omissions, no invented detail. If two readings are possible, choose the plainer one. Never translate a word by its surface form when the context makes another sense obviously correct.
+Accuracy comes first. The reader must receive exactly what the sender meant — no additions, no omissions, no invented detail. If two readings are possible, use the conversation above to choose. Never translate a word by its surface form when the context makes another sense obviously correct.
 
 Register: read the sender's formality from the original and match it.
 - Formal signals — Burmese ပါ / ပါတယ် / ခင်ဗျာ / ရှင့်, complete careful sentences, no slang. Translate into properly polite Thai with ครับ and full sentences.
@@ -279,7 +387,7 @@ Keep names, numbers, times, places and prices exactly as written.
 
 Clarity: complete sentences, natural word order, readable at a glance. A native ${target} speaker should believe a real person wrote it.
 
-Output ONLY the ${target} translation. No labels, no notes, no romanisation.
+Output ONLY the ${target} translation of the MESSAGE. No labels, no notes, no romanisation.
 
 MESSAGE:
 ${text}`;

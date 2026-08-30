@@ -4,3 +4,7 @@ compatibility_date = "2026-08-01"
 
 [observability]
 enabled = true
+
+[[kv_namespaces]]
+binding = "CHAT"
+id = "69c3f9e6034e43fcad87d1df3607e417"
