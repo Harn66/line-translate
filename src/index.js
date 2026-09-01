@@ -1,22 +1,25 @@
 const MY_GENDER = "male";
-const FRIEND_GENDER = "female";
 
 const MY_USER_ID = "Ua3a8f28e0fd8cdd360368751a955b4ae";
 
 const MENTIONS = ["@leon", "@harn", "@leon harn", "ลีออน", "လီယွန်"];
 
+// mode:   "translate" = reply in chat  |  "log" = silent, sheet only
+// style:  "friend" | "work"
+// gender: whose voice the Burmese is written in — "female", "male",
+//         or "mixed" to use no gendered particles at all
+// out:    optional. Where Thai goes. Defaults to Burmese.
 const GROUPS = {
-  Ce540ec9ff202d5ad182d7614345ddc8d: { name: "Friend 1", mode: "translate" },
-  Ca7a3b1006ab5302107fb6998032820a3: { name: "Friend 2", mode: "translate" },
-  C07c69b8cbdb79abb044810a5f8604b99: { name: "Crush", mode: "translate" },
-  Ceacc44a74c00d696414e16fddc5e5763: { name: "Silent test", mode: "log" },
-  Ca6b9669c63ec56ff3f18407864f39c3e: { name: "Front desk", mode: "log" },
-  Cfd0f7423a7c8b661c4e2aa6aafd4bd12: { name: "TCMR TCMO", mode: "log" },
+  Ce540ec9ff202d5ad182d7614345ddc8d: { name: "Friend 1", mode: "translate", style: "friend", gender: "female" },
+  Ca7a3b1006ab5302107fb6998032820a3: { name: "Friend 2", mode: "translate", style: "friend", gender: "female" },
+  C07c69b8cbdb79abb044810a5f8604b99: { name: "Crush", mode: "translate", style: "friend", gender: "female" },
+  Ceacc44a74c00d696414e16fddc5e5763: { name: "Silent test", mode: "log", style: "work", gender: "female" },
+  Ca6b9669c63ec56ff3f18407864f39c3e: { name: "Front desk", mode: "log", style: "work", gender: "female" },
+  Cfd0f7423a7c8b661c4e2aa6aafd4bd12: { name: "TCMR TCMO", mode: "log", style: "work", gender: "female" },
 };
 
-// how much of the conversation the model gets to see
 const CONTEXT_TURNS = 6;
-const CONTEXT_TTL = 1800; // 30 minutes
+const CONTEXT_TTL = 1800;
 
 export default {
   async fetch(request, env, ctx) {
@@ -74,7 +77,7 @@ function keyring(env) {
     .filter(Boolean);
 }
 
-function decideTarget(text) {
+function decideTarget(text, outLang) {
   const t = text.trim();
 
   if (!t) return null;
@@ -84,7 +87,7 @@ function decideTarget(text) {
   const mya = MYANMAR.test(t);
 
   if (thai && mya) return null;
-  if (thai) return "Burmese";
+  if (thai) return outLang || "Burmese";
   if (mya) return "Thai";
   if (LATIN.test(t)) return "Thai";
 
@@ -94,29 +97,43 @@ function decideTarget(text) {
 function mentionsMe(ev, text) {
   const tagged = ev.message?.mention?.mentionees;
 
+  const lower = text.toLowerCase();
+  const byName = MENTIONS.some((m) => lower.includes(m));
+
   if (Array.isArray(tagged) && tagged.length > 0) {
-    // only counts if one of the tagged people is actually me
-    return tagged.some((m) => m.userId === MY_USER_ID);
+    console.log("mentionees:", JSON.stringify(tagged));
+    return tagged.some((m) => m.userId === MY_USER_ID) || byName;
   }
 
-  const lower = text.toLowerCase();
-  return MENTIONS.some((m) => lower.includes(m));
+  return byName;
 }
 
 function routeFor(ev) {
   const src = ev.source ?? {};
 
   if (src.type === "user") {
-    return { name: "direct", mode: "translate", log: false };
+    return {
+      name: "direct",
+      mode: "translate",
+      log: false,
+      style: "friend",
+      gender: "female",
+    };
   }
 
   const conf = GROUPS[src.groupId];
   if (!conf) return null;
 
-  return { name: conf.name, mode: conf.mode, log: conf.mode === "log" };
+  return {
+    name: conf.name,
+    mode: conf.mode,
+    log: conf.mode === "log",
+    style: conf.style || "friend",
+    gender: conf.gender || "mixed",
+    out: conf.out,
+  };
 }
 
-// One rolling window per room, shared by everyone in it.
 function contextKey(ev) {
   const src = ev.source ?? {};
   return "ctx:" + (src.groupId || src.roomId || src.userId || "unknown");
@@ -182,7 +199,24 @@ async function handleOne(ev, env) {
       return;
     }
 
-    const msg = await archiveTasks(env);
+    const msg = await sheetAction("archive", env);
+    await reply(ev.replyToken, msg, env);
+    return;
+  }
+
+  if (text === "/closeday") {
+    const src = ev.source ?? {};
+
+    if (src.type !== "user") {
+      await reply(
+        ev.replyToken,
+        "Send /closeday in our private chat, not a group.",
+        env
+      );
+      return;
+    }
+
+    const msg = await sheetAction("closeday", env);
     await reply(ev.replyToken, msg, env);
     return;
   }
@@ -193,18 +227,26 @@ async function handleOne(ev, env) {
     return;
   }
 
-  const target = decideTarget(text);
+  const target = decideTarget(text, route.out);
   if (!target) {
     console.log("skipped:", text.slice(0, 40));
     return;
   }
 
-  const sender = await senderName(ev, env);
-  const history = await readContext(ev, env);
+  // these two do not depend on each other, so do them at once
+  const [sender, history] = await Promise.all([
+    senderName(ev, env),
+    readContext(ev, env),
+  ]);
 
-  const translation = await translateWithFallback(text, target, history, env);
+  const translation = await translateWithFallback(
+    text,
+    target,
+    history,
+    route,
+    env
+  );
 
-  // remember this turn for the next message in the room
   await writeContext(ev, env, history, sender, text);
 
   const tasks = [];
@@ -229,25 +271,22 @@ async function handleOne(ev, env) {
   await Promise.all(tasks);
 }
 
-async function archiveTasks(env) {
+async function sheetAction(action, env) {
   if (!env.SHEET_URL) return "Sheet is not connected.";
 
   try {
     const res = await fetch(env.SHEET_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        secret: env.SHEET_SECRET,
-        action: "archive",
-      }),
-      signal: AbortSignal.timeout(20000),
+      body: JSON.stringify({ secret: env.SHEET_SECRET, action }),
+      signal: AbortSignal.timeout(25000),
     });
 
     if (!res.ok) return "Sheet did not answer (" + res.status + ").";
 
     return await res.text();
   } catch (err) {
-    console.log("archive threw:", err);
+    console.log(action + " threw:", err);
     return "Could not reach the sheet. Try again.";
   }
 }
@@ -301,7 +340,7 @@ async function senderName(ev, env) {
   }
 }
 
-async function translateWithFallback(text, target, history, env) {
+async function translateWithFallback(text, target, history, route, env) {
   const keys = keyring(env);
   const started = Date.now();
 
@@ -318,7 +357,7 @@ async function translateWithFallback(text, target, history, env) {
 
       let r;
       try {
-        r = await translate(text, target, history, keys[i], model);
+        r = await translate(text, target, history, route, keys[i], model);
       } catch (err) {
         console.log(`${model} key${i + 1} threw:`, err);
         break;
@@ -339,20 +378,40 @@ async function translateWithFallback(text, target, history, env) {
 }
 
 function failMessage(target) {
+  if (target === "English") return "Sorry, translation failed. Try again.";
   return target === "Thai"
     ? "ขอโทษครับ ตอนนี้แปลไม่ได้ ลองใหม่อีกครั้งครับ"
     : "တောင်းပန်ပါတယ်။ အခုဘာသာပြန်လို့မရသေးပါ။ ခဏနေမှ ထပ်ကြိုးစားကြည့်ပါ။";
 }
 
-function voiceRules(target) {
+// Thai output is always my own words. Burmese output is whoever wrote
+// the Thai, so that gender comes from the group setting.
+function voiceRules(target, gender) {
   if (target === "Thai") {
     return MY_GENDER === "male"
       ? `The speaker is MALE. Use male Thai forms only: ครับ as the polite particle, ผม for "I". NEVER use ค่ะ, คะ, ดิฉัน, or any other female form — that would misgender the speaker.`
       : `The speaker is FEMALE. Use female Thai forms only: ค่ะ / คะ as the polite particle, ดิฉัน or ฉัน for "I". Never use ครับ or ผม.`;
   }
-  return FRIEND_GENDER === "female"
-    ? `The speaker is FEMALE. Use female Burmese forms: ရှင့် / ရှင် for polite address, ကျွန်မ for "I". Never use ခင်ဗျာ or ကျွန်တော်.`
-    : `The speaker is MALE. Use male Burmese forms: ခင်ဗျာ for polite address, ကျွန်တော် for "I". Never use ရှင့် or ကျွန်မ.`;
+
+  if (target === "Burmese") {
+    if (gender === "female") {
+      return `The speaker is FEMALE. Use female Burmese forms: ရှင့် / ရှင် for polite address, ကျွန်မ for "I". Never use ခင်ဗျာ or ကျွန်တော်.`;
+    }
+    if (gender === "male") {
+      return `The speaker is MALE. Use male Burmese forms: ခင်ဗျာ for polite address, ကျွန်တော် for "I". Never use ရှင့် or ကျွန်မ.`;
+    }
+    return `The speaker's gender is unknown. Write the Burmese without gendered particles — no ရှင့်, no ခင်ဗျာ. For "I" use ကျွန်တော်/ကျွန်မ only if the sentence truly needs it; prefer phrasing that avoids it. A wrong particle is worse than none.`;
+  }
+
+  return "";
+}
+
+function styleRules(style) {
+  if (style === "work") {
+    return `This is a workplace group between hotel staff. Keep it professional but not stiff — the way colleagues who know each other actually write. Clear and unambiguous matters more than warmth here: times, room numbers, prices and names must survive exactly. Do not add friendliness the original did not have, and do not strip politeness it did have.`;
+  }
+
+  return `This is a chat between friends. Write it the way a real person texts a friend — relaxed, natural, contractions and particles where they belong. Jokes stay jokes, slang gets the closest natural slang. Do not make it more formal or more distant than the original.`;
 }
 
 function contextBlock(history) {
@@ -367,21 +426,18 @@ ${lines}
 `;
 }
 
-async function translate(text, target, history, apiKey, model) {
+async function translate(text, target, history, route, apiKey, model) {
   const prompt = `Translate the MESSAGE below into ${target}. The output must be written in ${target} and nothing else.
 
-${voiceRules(target)}
+${voiceRules(target, route.gender)}
 
-${contextBlock(history)}This is a real chat, so the input may be messy: typos, missing words, no punctuation, mixed-in English, or romanised script. Never comment on any of that. Work out what the sender meant and translate that meaning.
+${styleRules(route.style)}
+
+${contextBlock(history)}The input may be messy: typos, missing words, no punctuation, mixed-in English, or romanised script. Never comment on any of that. Work out what the sender meant and translate that meaning.
 
 Accuracy comes first. The reader must receive exactly what the sender meant — no additions, no omissions, no invented detail. If two readings are possible, use the conversation above to choose. Never translate a word by its surface form when the context makes another sense obviously correct.
 
-Register: read the sender's formality from the original and match it.
-- Formal signals — Burmese ပါ / ပါတယ် / ခင်ဗျာ / ရှင့်, complete careful sentences, no slang. Translate into properly polite Thai with ครับ and full sentences.
-- Casual signals — slang, jokes, shortened words, no politeness particles, playful spelling. Translate into relaxed everyday Thai. Keep the humour: slang gets the closest natural slang, a joke stays a joke.
-- Neutral stays neutral.
-- Never make the message warmer, ruder, more familiar or more distant than it was.
-- No emoji unless the original had them.
+Match the sender's formality. Formal stays formal, casual stays casual, neutral stays neutral. Never make the message warmer, ruder, more familiar or more distant than it was. No emoji unless the original had them.
 
 Keep names, numbers, times, places and prices exactly as written.
 
